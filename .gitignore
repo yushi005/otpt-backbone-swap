@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+.venv/
+.env
+.ipynb_checkpoints/
+*.egg-info/
+.pytest_cache/
+
+# Data + model caches (kept out of git; downloaded on demand)
+data/eurosat_tv/
+data/dermamnist/
+*.pt
+*.pth
+*.bin
+
+# Results outputs from pilot runs
+results/*.csv
