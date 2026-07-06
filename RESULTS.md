@@ -18,12 +18,13 @@ Domain-specific backbone pilots for O-TPT (CVPR'25). One small dataset per backb
 
 | Check | Backbone | Result |
 |-------|----------|--------|
-| Model loads + expected attrs present         | RemoteCLIP | _pending_ |
-| Zero-shot top-1 on first 20 EuroSAT test    | RemoteCLIP | _pending_ |
-| `ctx.grad` non-None after one TTA backward   | RemoteCLIP | _pending_ |
-| Parity cosine-sim vs `open_clip.encode_text` | BioMedCLIP | _pending_ |
-| Zero-shot top-1 on first 20 DermaMNIST-224   | BioMedCLIP | _pending_ |
-| `ctx.grad` non-None after one TTA backward   | BioMedCLIP | _pending_ |
+| Model loads + expected attrs present         | RemoteCLIP | **PASS** — all 8 CLIP-expected attributes present, ViT-B/32 checkpoint layout matches OpenAI CLIP exactly (302 keys, 0 missing/unexpected) |
+| Zero-shot top-1 on first 20 EuroSAT test    | RemoteCLIP | Skipped (opt-in via `SMOKE_FULL=1`; runs on remote GPU in the pilot) |
+| `ctx.grad` non-None after one TTA backward   | RemoteCLIP | **PASS** — ctx.grad norm 12.04 |
+| Parity cosine-sim vs `open_clip.encode_text` | BioMedCLIP | **PASS** — min cos-sim 0.9999999 across all 7 classes |
+| Zero-shot top-1 on first 20 DermaMNIST-224   | BioMedCLIP | Skipped (opt-in via `SMOKE_FULL=1`) |
+| `ctx.grad` non-None after one TTA backward   | BioMedCLIP | **PASS** — ctx.grad norm 43.55 |
+| **End-to-end integration** through `otpt_classification.py` | BioMedCLIP + DermaMNIST | **PASS** — 40+ images processed at ~0.85 s/image, running top-1 ≈36% (chance ≈14% on 7-way, so a plausible ZS start); orthogonality loss, AdamW step, and CPU AMP shim all exercised without crash |
 
 ## Design decisions to flag to advisor
 
@@ -33,6 +34,19 @@ Domain-specific backbone pilots for O-TPT (CVPR'25). One small dataset per backb
 4. **DermaMNIST resolution.** Using the 224×224 variant (`medmnist>=3.0`) rather than the 28×28 default, so images actually resemble BioMedCLIP's pretraining distribution.
 5. **Device-agnostic loop.** Patched `otpt_classification.py` to drop hard `.cuda(args.gpu)` and `torch.cuda.amp.autocast` calls; CUDA path is preserved bit-identically on GPU boxes but CPU/MPS boxes can run the same code (used for smoke tests here).
 6. **Not run this session.** The pilot itself (full test set, per O-TPT paper protocol) is deferred to a remote GPU. This laptop cannot run 64 AugMix views × ~2,700 test images through ViT-B/16 in a reasonable time.
+
+## How to run the pilot (on a remote GPU)
+
+```bash
+# From the repo root, with the otpt conda env activated (see otpt-base/environment.yml):
+bash scripts/run_pilot_remoteclip.sh   [DATA_ROOT] [GPU_ID]
+bash scripts/run_pilot_biomedclip.sh   [DATA_ROOT] [GPU_ID]
+```
+
+Defaults: `DATA_ROOT=./data`, `GPU_ID=0`. Both datasets auto-download on first run
+(EuroSAT ~2GB via torchvision, DermaMNIST-224 ~1GB via medmnist). CSV outputs land
+in `results/pilot_{remoteclip_eurosat,biomedclip_dermamnist}.csv` — grab the final
+`Accuracy` and `ECE.` rows for the table above.
 
 ## Open follow-ups
 
