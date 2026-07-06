@@ -21,13 +21,30 @@ _tokenizer = _Tokenizer()
 
 DOWNLOAD_ROOT='~/.cache/clip'
 
+
+def _load_backbone(arch, device):
+    """Load a CLIP-shaped backbone. Adds a 'remoteclip' arch for the pilot;
+    otherwise defers to the vendored OpenAI CLIP `load()`. Returns a tuple
+    matching (`clip.load`'s return: model, embed_dim (or None), preprocess)."""
+    if arch == "remoteclip":
+        # Repo-root path resolution: backbones/ lives one level above otpt-base/.
+        import os as _os, sys as _sys
+        _repo_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        if _repo_root not in _sys.path:
+            _sys.path.insert(0, _repo_root)
+        from backbones.remoteclip_loader import load_remoteclip
+        model, preprocess = load_remoteclip(device=device, download_root=DOWNLOAD_ROOT)
+        return model, None, preprocess
+    return load(arch, device=device, download_root=DOWNLOAD_ROOT)
+
 class ClipImageEncoder(nn.Module):
     def __init__(self, device, arch="ViT-L/14", image_resolution=224, n_class=1000):
         super(ClipImageEncoder, self).__init__()
-        clip, embed_dim, _ = load(arch, device=device, download_root=DOWNLOAD_ROOT)
+        clip, embed_dim, _ = _load_backbone(arch, device)
         self.encoder = clip.visual
         del clip.transformer
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         self.cls_head = nn.Linear(embed_dim, n_class)
     
@@ -182,7 +199,7 @@ class PromptLearner(nn.Module):
             self.cls_init_state = cls_vectors.detach().clone()
         tokenized_prompts = torch.cat([tokenize(p) for p in prompts]).to(self.device)
         #print("concatenated combined prompt class tokenized shape-reset:",tokenized_prompts.shape)
-        clip, _, _ = load(arch, device=self.device, download_root=DOWNLOAD_ROOT)
+        clip, _, _ = _load_backbone(arch, self.device)
 
         with torch.no_grad():
             embedding = clip.token_embedding(tokenized_prompts).type(self.dtype)
@@ -296,7 +313,7 @@ class ClipTestTimeTuning(nn.Module):
     def __init__(self, device, classnames, batch_size, criterion='cosine', arch="ViT-L/14",
                         n_ctx=16, ctx_init=None, ctx_position='end', learned_cls=False):
         super(ClipTestTimeTuning, self).__init__()
-        clip, _, _ = load(arch, device=device, download_root=DOWNLOAD_ROOT)
+        clip, _, _ = _load_backbone(arch, device)
         self.image_encoder = clip.visual
         self.text_encoder = TextEncoder(clip)
         self.logit_scale = clip.logit_scale.data
