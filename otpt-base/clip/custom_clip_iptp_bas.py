@@ -377,13 +377,19 @@ class ClipTestTimeTuning(nn.Module):
 def get_coop(clip_arch, test_set, device, n_ctx, ctx_init, cons, learned_cls=False):
     if test_set in fewshot_datasets:
         classnames = eval("{}_classes".format(test_set.lower()))
+    elif test_set == 'eurosat_tv':
+        from data.cls_to_names import eurosat_tv_classes
+        classnames = eurosat_tv_classes
+    elif test_set == 'dermamnist':
+        from data.cls_to_names import dermamnist_classes
+        classnames = dermamnist_classes
     elif test_set == 'bongard':
         if learned_cls:
             classnames = ['X', 'X']
         else:
             classnames = ['True', 'False']
     elif test_set == 'C':
-           classnames = covid_classes        
+           classnames = covid_classes
     else:
         classnames = imagenet_classes
 

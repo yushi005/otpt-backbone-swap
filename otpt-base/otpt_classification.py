@@ -38,7 +38,9 @@ except ImportError:
 import torchvision.models as models
 
 from clip.custom_clip_iptp_bas import get_coop
+from clip.custom_clip_biomedclip import get_coop_biomedclip
 from clip.cocoop import get_cocoop
+from contextlib import nullcontext
 from data.imagnet_prompts import imagenet_classes
 from data.datautils import AugMixAugmenter, build_dataset
 from utils.tools import Summary, AverageMeter, ProgressMeter, accuracy, load_model_weight, set_random_seed
@@ -119,15 +121,50 @@ def Calculator(result_dict):
 
 
 
+def _resolve_device(args):
+    """Resolve a torch.device from args.gpu (an int index) with CPU/MPS
+    fallback. CUDA is preferred; MPS is opt-in via args.allow_mps to keep
+    the remote-GPU default behavior identical to upstream."""
+    if torch.cuda.is_available() and args.gpu is not None:
+        return torch.device("cuda", int(args.gpu))
+    if getattr(args, "allow_mps", False) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _amp_context(device):
+    """Enable autocast fp16 only on CUDA. On CPU/MPS return a no-op context."""
+    if device.type == "cuda":
+        return torch.cuda.amp.autocast()
+    return nullcontext()
+
+
+class _NullGradScaler:
+    """Drop-in no-op replacement for torch.cuda.amp.GradScaler on CPU/MPS.
+    Preserves the scale/step/update call surface used by the O-TPT loop."""
+
+    def scale(self, loss):
+        return loss
+
+    def step(self, optimizer):
+        optimizer.step()
+
+    def update(self):
+        pass
+
+    def load_state_dict(self, state):
+        pass
+
+    def state_dict(self):
+        return {}
+
+
 def conf_acc(logits):
       Nb =  logits.shape[0]
       prob,_ = torch.max(logits.softmax(1),dim=1)
-      #print("prob value:", prob)
-      q_val = torch.ones(Nb).to(device=args.gpu)
-      #print("ones values", q_val)
-      cosi = torch.nn.CosineSimilarity(dim=0) 
+      q_val = torch.ones(Nb, device=logits.device)
+      cosi = torch.nn.CosineSimilarity(dim=0)
       dw=cosi(prob,q_val)
-      #print("similarity:",dw)
       return dw
 def select_confident_samples(logits, top):
     #computing the softmax and log-values +summing up
@@ -176,9 +213,10 @@ def test_time_tuning(model, inputs, optimizer, scaler, args, cons):
         optimizer = torch.optim.AdamW([pgen_ctx], args.lr)
     
     selected_idx = None
+    _device = getattr(args, "_device", torch.device("cpu"))
     for j in range(args.tta_steps):
         if 'tpt' in args.run_type:
-            with torch.cuda.amp.autocast():
+            with _amp_context(_device):
                 if args.cocoop:
                     #it does require prompt to tune
                     output = model((image_feature, pgen_ctx),cons,args)
@@ -216,11 +254,11 @@ def test_time_tuning(model, inputs, optimizer, scaler, args, cons):
             scaler.update()
             loss = 0
 
-            with torch.cuda.amp.autocast():
+            with _amp_context(_device):
                 if args.cocoop:
                     output2 = model((image_feature, pgen_ctx),cons,args)
                 else:
-                    output2,text_varience = model(inputs,cons,args) 
+                    output2,text_varience = model(inputs,cons,args)
 
         if 'otpt' in args.run_type:
             if output == None and output2 == None:
@@ -237,7 +275,7 @@ def test_time_tuning(model, inputs, optimizer, scaler, args, cons):
             wwt_norm_col_HT = torch.linalg.norm(Wwt,dim=-1)
             Wwt_val_HT = wwt_norm_col_HT.mean()
             #wtW  =  torch.matmul(text_feature.T,text_feature)
-            e = torch.eye(Wwt.shape[1], device=args.gpu)
+            e = torch.eye(Wwt.shape[1], device=text_feature.device)
             M_norm = torch.linalg.norm(Wwt, dim=0,keepdim=True)
             scaled_e = e * M_norm
             # Subtract the scaled identity matrix from Wwt
@@ -306,28 +344,42 @@ def main(args):
 
     set_random_seed(args.seed)
 
-    # This codebase has only been tested under the single GPU setting
-    assert args.gpu is not None
+    # Upstream O-TPT required a specific CUDA device; the backbone-swap pilot
+    # runs the same code on CPU / MPS for smoke tests. args.gpu is preserved
+    # as-is for CUDA runs but ignored when torch.cuda is not available.
     main_worker(args.gpu, args)
 
 
 def main_worker(gpu, args):
     args.gpu = gpu
     set_random_seed(args.seed)
-    print("Use GPU: {} for training".format(args.gpu))
+    args._device = _resolve_device(args)
+    print("Use device: {} for training".format(args._device))
 
     # create model (zero-shot clip model (ViT-L/14@px336) with promptruning)
     if args.test_sets in fewshot_datasets:
         classnames = eval("{}_classes".format(args.test_sets.lower()))
+    elif args.test_sets == 'eurosat_tv':
+        from data.cls_to_names import eurosat_tv_classes
+        classnames = eurosat_tv_classes
+    elif args.test_sets == 'dermamnist':
+        from data.cls_to_names import dermamnist_classes
+        classnames = dermamnist_classes
     else:
         classnames = imagenet_classes
     if args.cocoop:
         model = get_cocoop(args.arch, args.test_sets, 'cpu', args.n_ctx,args.disp_cons)
         assert args.load is not None
-        load_model_weight(args.load, model, "cuda:{}".format(args.gpu), args) # to load to cuda: device="cuda:{}".format(args.gpu)
+        load_model_weight(args.load, model, str(args._device), args)
         model_state = deepcopy(model.state_dict())
+    elif args.arch == "biomedclip":
+        model = get_coop_biomedclip(
+            args.arch, args.test_sets, args._device,
+            args.n_ctx, args.ctx_init, args.disp_cons,
+        )
+        model_state = None
     else:
-        model = get_coop(args.arch, args.test_sets, args.gpu, args.n_ctx,args.ctx_init,args.disp_cons)
+        model = get_coop(args.arch, args.test_sets, args._device, args.n_ctx,args.ctx_init,args.disp_cons)
         if args.load is not None:
             print("Use pre-trained soft prompt (CoOp) as initialization")
             #pre-trained weights
@@ -351,13 +403,14 @@ def main_worker(gpu, args):
                 param.requires_grad_(False)
     
     print("=> Model created: visual backbone {}".format(args.arch))
-    
-    if not torch.cuda.is_available():
-        print('using CPU, this will be slow')
+
+    device = args._device
+    if device.type == "cuda":
+        torch.cuda.set_device(device.index if device.index is not None else 0)
+        model = model.cuda(device.index if device.index is not None else 0)
     else:
-        assert args.gpu is not None
-        torch.cuda.set_device(args.gpu)
-        model = model.cuda(args.gpu)
+        print('using {}, this will be slow'.format(device))
+        model = model.to(device)
 
     # define optimizer
     if args.cocoop:
@@ -368,10 +421,14 @@ def main_worker(gpu, args):
         optimizer = torch.optim.AdamW(trainable_param, args.lr)
         optim_state = deepcopy(optimizer.state_dict())
 
-    # setup automatic mixed-precision (Amp) loss scaling
-    scaler = torch.cuda.amp.GradScaler(init_scale=1000)
-
-    print('=> Using native Torch AMP. Training in mixed precision.')
+    # AMP GradScaler is only meaningful on CUDA. On CPU/MPS we use a no-op
+    # shim so scaler.scale(loss).backward()/step/update all pass through.
+    if device.type == "cuda":
+        scaler = torch.cuda.amp.GradScaler(init_scale=1000)
+        print('=> Using native Torch AMP. Training in mixed precision.')
+    else:
+        scaler = _NullGradScaler()
+        print('=> AMP disabled (device={}); running fp32.'.format(device))
 
     cudnn.benchmark = True
 
@@ -427,10 +484,16 @@ def main_worker(gpu, args):
         print("evaluating: {}".format(set_id))
         # reset the model
         # Reset classnames of custom CLIP model
-        if len(set_id) > 1: 
+        if len(set_id) > 1:
             # fine-grained classification datasets
-            classnames = eval("{}_classes".format(set_id.lower()))
-            #print("classnames:",classnames)
+            if set_id == 'eurosat_tv':
+                from data.cls_to_names import eurosat_tv_classes
+                classnames = eurosat_tv_classes
+            elif set_id == 'dermamnist':
+                from data.cls_to_names import dermamnist_classes
+                classnames = dermamnist_classes
+            else:
+                classnames = eval("{}_classes".format(set_id.lower()))
         else:
             assert set_id in ['A', 'R', 'K', 'V', 'I']
             classnames_all = imagenet_classes
@@ -450,7 +513,7 @@ def main_worker(gpu, args):
             model.prompt_generator.reset_classnames(classnames, args.arch)
             model = model.cpu()
             model_state = model.state_dict()
-            model = model.cuda(args.gpu)
+            model = model.to(args._device)
         else:
             model.reset_classnames(classnames, args.arch)
 
@@ -479,10 +542,15 @@ def main_worker(gpu, args):
 
     dataset_ids = list(results.keys())
 
-    #file_path = args.csv_log
-    
-    directory = os.path.dirname('/home/ashashak/VLM-calibration/C-TPT/log/test_ctpt_finegrained_HT_-lambda-{}.csv'.format(len(dataset_ids)))
-    custom_path = '/home/ashashak/VLM-calibration/C-TPT/log/test_ctpt_finegrained_HT_-lambda-{}.csv'.format(len(dataset_ids))
+    # Backbone-swap pilot: fall back to --csv_log (or repo-local results/) when
+    # the upstream hard-coded author path is unavailable.
+    if args.csv_log:
+        custom_path = args.csv_log
+    else:
+        custom_path = os.path.join(
+            'results', 'test_ctpt_finegrained_HT_-lambda-{}.csv'.format(len(dataset_ids))
+        )
+    directory = os.path.dirname(custom_path)
     # Ensure the directory exists
     os.makedirs(directory, exist_ok=True)
     
@@ -564,22 +632,22 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
 
     #initializing result_dictionary    
     result_dict = {'max_confidence': [], 'prediction': [], 'label': []}  
+    device = getattr(args, "_device", torch.device("cpu"))
+    non_blocking = (device.type == "cuda")
     for i, (images, target) in enumerate(val_loader):
-        
-        assert args.gpu is not None
-        
+
         if isinstance(images, list):
             for k in range(len(images)):
-                images[k] = images[k].cuda(args.gpu, non_blocking=True)
+                images[k] = images[k].to(device, non_blocking=non_blocking)
             image = images[0]
         else:
             if len(images.size()) > 4:
                 # when using ImageNet Sampler as the dataset
                 assert images.size()[0] == 1
                 images = images.squeeze(0)
-            images = images.cuda(args.gpu, non_blocking=True)
+            images = images.to(device, non_blocking=non_blocking)
             image = images
-        target = target.cuda(args.gpu, non_blocking=True)
+        target = target.to(device, non_blocking=non_blocking)
         if args.tpt:
             images = torch.cat(images, dim=0)
 
@@ -597,7 +665,7 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
             test_time_tuning(model, images, optimizer, scaler, args,cons)
         else:
             with torch.no_grad():
-                with torch.cuda.amp.autocast():
+                with _amp_context(device):
                     image_feature, pgen_ctx = model.gen_ctx(images, args.tpt)
             optimizer = None
             #fine-tuned prompt embeddings
@@ -609,7 +677,7 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
                 image_feature = image_feature[0].unsqueeze(0)
         
         with torch.no_grad():
-            with torch.cuda.amp.autocast():
+            with _amp_context(device):
                 if args.cocoop:
                     output = model((image_feature, pgen_ctx),cons,args)
                 else:
