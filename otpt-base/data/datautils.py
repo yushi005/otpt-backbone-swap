@@ -35,7 +35,9 @@ ID_to_DIRNAME={
     'food101': 'Food101',
     'sun397': 'SUN397',
     'aircraft': 'fgvc_aircraft',
-    'eurosat': 'eurosat'
+    'eurosat': 'eurosat',
+    'eurosat_tv': 'eurosat_tv',
+    'dermamnist': 'dermamnist',
 }
 
 distortions = ['gaussian_noise', 'shot_noise', 'impulse_noise',
@@ -43,6 +45,30 @@ distortions = ['gaussian_noise', 'shot_noise', 'impulse_noise',
                 'zoom_blur', 'frost',
                 'brightness', 'contrast', 'elastic_transform',
                 'pixelate','fog','speckle_noise','saturate', 'spatter', 'gaussian_blur']
+
+
+class _MedMNISTAdapter(torch.utils.data.Dataset):
+    """medmnist datasets return (PIL, np.ndarray-shape-[1]) — squash the label
+    to an int and pass PIL through the given transform (which is either a plain
+    torchvision Compose or an AugMixAugmenter that yields a list of tensors)."""
+
+    def __init__(self, raw, transform):
+        self.raw = raw
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.raw)
+
+    def __getitem__(self, idx):
+        img, label = self.raw[idx]
+        # medmnist labels are numpy arrays of shape [1] for multi-class tasks.
+        if hasattr(label, "item"):
+            label = int(label.item()) if label.size == 1 else int(label[0])
+        else:
+            label = int(label)
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, torch.tensor(label).long()
 
 
 def build_dataset(set_id, transform, data_root, mode='test', n_shot=None, split="all", bongard_anno=False):
@@ -65,6 +91,25 @@ def build_dataset(set_id, transform, data_root, mode='test', n_shot=None, split=
             testset = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode, n_shot=n_shot)
         else:
             testset = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode)
+
+    elif set_id == 'eurosat_tv':
+        # Backbone-swap pilot: torchvision EuroSAT. Class order is alphabetical
+        # (AnnualCrop, Forest, HerbaceousVegetation, Highway, Industrial, Pasture,
+        #  PermanentCrop, Residential, River, SeaLake) — must match `eurosat_tv_classes`.
+        root = os.path.join(data_root, ID_to_DIRNAME[set_id])
+        os.makedirs(root, exist_ok=True)
+        testset = datasets.EuroSAT(root=root, download=True, transform=transform)
+
+    elif set_id == 'dermamnist':
+        # Backbone-swap pilot: DermaMNIST at 224x224 via medmnist>=3.0.
+        # medmnist ships PIL images; the O-TPT pipeline expects a torchvision-style
+        # dataset returning (image, int_label). We adapt here.
+        import medmnist  # local import so envs without medmnist can still import datautils
+        root = os.path.join(data_root, ID_to_DIRNAME[set_id])
+        os.makedirs(root, exist_ok=True)
+        split = {'test': 'test', 'train': 'train', 'val': 'val'}.get(mode, 'test')
+        raw = medmnist.DermaMNIST(split=split, size=224, download=True, root=root, as_rgb=True)
+        testset = _MedMNISTAdapter(raw, transform)
 
     elif set_id == 'bongard':
         assert isinstance(transform, Tuple)

@@ -195,4 +195,7 @@ dependencies:
     - yapf==0.29.0
     - zipp==3.17.0
     - seaborn==0.13.2
+    # Added for backbone-swap pilots (RemoteCLIP + BioMedCLIP)
+    - open_clip_torch>=2.24
+    - medmnist>=3.0
 
